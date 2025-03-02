@@ -13,8 +13,10 @@
 import torch
 from einops import rearrange
 from torch import nn
+import torch.distributed as dist
 from torch.nn import functional as F
 from stepvideo.utils import with_empty_init
+from typing import Optional, List, Tuple, Dict, Any
 
 
 def base_group_norm(x, norm_layer, act_silu=False, channel_last=False):
@@ -1006,3 +1008,194 @@ class AutoencoderKL(nn.Module):
         x[:, back] = x[:, back] * remain_scale + x[:, front] * mix_scale
         x[:, front] = x[:, front] * remain_scale + x[:, back] * mix_scale
         return x
+
+
+class DistributedAutoencoderKL(nn.Module):
+    def __init__(
+        self,
+        original_vae,
+        rank: int = 0,
+        world_size: int = 2,
+        gpu_partition_size: Optional[int] = None,
+        batch_parallel: bool = True
+    ):
+        """
+        Wrapper around AutoencoderKL that supports distributed processing.
+        
+        Args:
+            original_vae: The original VAE model to be distributed
+            rank: Current process rank
+            world_size: Total number of processes
+            gpu_partition_size: Size of tensor partitions per GPU (if None, calculated automatically)
+            batch_parallel: Whether to use batch parallelism (split batch across GPUs)
+                           or model parallelism (split model across GPUs)
+        """
+        super().__init__()
+        self.original_vae = original_vae
+        self.rank = rank
+        self.world_size = world_size
+        self.batch_parallel = batch_parallel
+        
+        # Configure the partition size for tensor sharding
+        self.gpu_partition_size = gpu_partition_size
+        if self.gpu_partition_size is None:
+            # Auto calculate partition size
+            if hasattr(original_vae.decoder, 'inner_dim'):
+                self.gpu_partition_size = original_vae.decoder.inner_dim // world_size
+            else:
+                # Default to an even split if inner_dim not available
+                self.gpu_partition_size = 64  # Default value, adjust based on model
+
+        # Create process group for communication
+        if not hasattr(dist, 'model_parallel_group'):
+            dist.model_parallel_group = dist.new_group(list(range(world_size)))
+        
+        # Initialize parameters
+        self.frame_len = original_vae.frame_len
+        self.latent_len = original_vae.latent_len
+        self.spatial_compression_ratio = original_vae.decoder.patch_size if hasattr(original_vae.decoder, 'patch_size') else 16
+        self.temporal_compression_ratio = 8  # Assuming this is constant
+        
+        # Set to eval mode by default
+        self.eval()
+        
+    def _partition_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Partition a tensor for model parallelism"""
+        if not self.batch_parallel:
+            # For model parallelism, split tensors along channel dimension
+            # This needs to be adapted based on the specific model architecture
+            if len(tensor.shape) >= 5:  # For 5D tensors (B, C, T, H, W)
+                # Split along channel dimension
+                split_size = max(1, tensor.size(1) // self.world_size)
+                start_idx = self.rank * split_size
+                end_idx = min(start_idx + split_size, tensor.size(1))
+                return tensor[:, start_idx:end_idx]
+            elif len(tensor.shape) >= 3:  # For 3D tensors (B, T, C)
+                # Split along feature dimension
+                split_size = max(1, tensor.size(2) // self.world_size)
+                start_idx = self.rank * split_size
+                end_idx = min(start_idx + split_size, tensor.size(2))
+                return tensor[:, :, start_idx:end_idx]
+            else:
+                # For other tensors, return as is (might need custom logic)
+                return tensor
+        else:
+            # For batch parallelism, split along batch dimension
+            split_size = max(1, tensor.size(0) // self.world_size)
+            start_idx = self.rank * split_size
+            end_idx = min(start_idx + split_size, tensor.size(0))
+            return tensor[start_idx:end_idx]
+    
+    def _gather_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather tensors from all processes"""
+        if self.world_size == 1:
+            return tensor
+            
+        # Create list to gather tensors
+        gather_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
+        
+        # All-gather operation
+        if self.batch_parallel:
+            # For batch parallelism, gather along batch dimension
+            dist.all_gather(gather_list, tensor, group=dist.model_parallel_group)
+            return torch.cat(gather_list, dim=0)
+        else:
+            # For model parallelism, gather along channel/feature dimension
+            if len(tensor.shape) >= 5:  # For 5D tensors
+                dist.all_gather(gather_list, tensor, group=dist.model_parallel_group)
+                return torch.cat(gather_list, dim=1)
+            elif len(tensor.shape) >= 3:  # For 3D tensors
+                dist.all_gather(gather_list, tensor, group=dist.model_parallel_group)
+                return torch.cat(gather_list, dim=2)
+            else:
+                # For other tensors, just return as is
+                return tensor
+
+    @torch.no_grad()
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Distributed encode implementation"""
+        # Use batch parallelism for encoding
+        if self.world_size > 1:
+            # Partition input tensor
+            x_local = self._partition_tensor(x)
+            
+            # Encode the local portion
+            z_local = self.original_vae.encode(x_local)
+            
+            # Gather results from all processes
+            z = self._gather_tensor(z_local)
+            return z
+        else:
+            # Single GPU case
+            return self.original_vae.encode(x)
+    
+    @torch.no_grad()
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Distributed decode implementation"""
+        # Special handling for decode since it's memory-intensive
+        if self.world_size > 1:
+            # Split the latent vector chunks
+            chunks = list(z.split(self.latent_len, dim=1))
+            chunk_count = len(chunks)
+            
+            # Distribute chunks across GPUs
+            chunks_per_gpu = (chunk_count + self.world_size - 1) // self.world_size
+            start_idx = self.rank * chunks_per_gpu
+            end_idx = min(start_idx + chunks_per_gpu, chunk_count)
+            
+            # Process local chunks
+            local_chunks = chunks[start_idx:end_idx]
+            processed_chunks = []
+            
+            for chunk in local_chunks:
+                # Process each chunk locally
+                decoded = self.original_vae.decode_naive(chunk, is_init=True).permute(0, 2, 1, 3, 4)
+                processed_chunks.append(decoded)
+            
+            # If no chunks were processed locally, create a dummy tensor for gathering
+            if not processed_chunks:
+                # Create a dummy tensor for communication
+                dummy_shape = list(chunks[0].shape)
+                dummy_shape[1] = self.frame_len  # Adjust for output frame length
+                dummy = torch.zeros(
+                    dummy_shape, 
+                    device=z.device, 
+                    dtype=next(self.original_vae.parameters()).dtype
+                )
+                processed_chunks = [dummy]
+            
+            # Concatenate local results
+            local_results = torch.cat(processed_chunks, dim=1)
+            
+            # Gather results from all processes
+            gathered_results = [torch.zeros_like(local_results) for _ in range(self.world_size)]
+            dist.all_gather(gathered_results, local_results, group=dist.model_parallel_group)
+            
+            # Only main process combines the results
+            if self.rank == 0:
+                # Combine the gathered results
+                all_chunks = []
+                for rank in range(self.world_size):
+                    rank_start = rank * chunks_per_gpu
+                    rank_end = min(rank_start + chunks_per_gpu, chunk_count)
+                    if rank_start < chunk_count:
+                        # Extract relevant chunks from this rank's results
+                        for i in range(rank_end - rank_start):
+                            chunk_idx = i + (0 if rank_start >= rank_end else 0)
+                            all_chunks.append(gathered_results[rank][:, chunk_idx:chunk_idx+1])
+                
+                # Ensure we have the correct number of chunks
+                all_chunks = all_chunks[:chunk_count]
+                
+                # Concatenate along temporal dimension
+                x = torch.cat(all_chunks, dim=1)
+                
+                # Apply mixing for temporal consistency
+                x = self.original_vae.mix(x)
+                return x
+            else:
+                # Non-main processes return None
+                return None
+        else:
+            # Single GPU case, use original implementation
+            return self.original_vae.decode(z)
